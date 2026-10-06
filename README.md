@@ -87,8 +87,9 @@ Expected response:
 
 ### Client
 
-`client.py` uploads one audio file and writes subtitles next to it. For `interview.mp3` the
-defaults are `interview.mp3.json` (the service JSON) and `interview.srt`. Each SRT cue keeps the
+`client.py` uploads one audio file and saves the service JSON. For `interview.mp3` the defaults
+are `interview.mp3.json` and `interview.srt`. The SRT is produced by
+[`json_to_srt.py`](json_to_srt.py) when that script is next to `client.py`. Each cue keeps the
 speaker id:
 
 ```
@@ -100,6 +101,7 @@ speaker id:
 ```bash
 ./client.py --svc_url http://localhost:8003/ interview.mp3
 ./client.py --svc_url http://localhost:8003/ --language ru interview.mp3
+./json_to_srt.py interview.mp3.json --srt interview.srt
 ```
 
 `POST /transcribe` answers with a job id. The client then polls `GET /progress/{uid}`

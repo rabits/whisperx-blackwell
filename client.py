@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Send one audio file to the WhisperX service and write JSON and SRT.
+"""Send one audio file to the WhisperX service and write the JSON response.
 
-The SRT cue text is the segment text with a speaker prefix, for example
-"[SPEAKER_01]: Hello everyone."
+SRT conversion is done by json_to_srt.py when that script sits next to this
+one. The command line stays the same either way: --srt still names the
+subtitle file, and an empty --srt skips it.
 
 Examples:
   ./client.py --svc_url http://ai-01.psa:8003/ in.mp3
@@ -17,6 +18,7 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 import uuid
@@ -79,14 +81,6 @@ def progress_log_lines(progress: dict, seen: dict) -> list[str]:
         seen[name] = bucket
         lines.append(f"{label:<22} {percent:6.1f}%")
     return lines
-
-
-def format_timestamp(seconds: float) -> str:
-    millis = int(round(max(0.0, seconds) * 1000))
-    hours, millis = divmod(millis, 3_600_000)
-    minutes, millis = divmod(millis, 60_000)
-    secs, millis = divmod(millis, 1_000)
-    return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
 
 
 def normalize_phrase(text: str) -> str:
@@ -189,36 +183,45 @@ def filter_payload(payload: dict, blob: str) -> list[str]:
     return dropped
 
 
-def cue_text(segment: dict) -> str:
-    text = " ".join(str(segment.get("text", "")).split())
-    if not text:
-        return ""
-    speaker = str(segment.get("speaker") or "").strip()
-    if speaker:
-        return f"[{speaker}]: {text}"
-    return text
+def converter_path() -> str | None:
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "json_to_srt.py")
+    if os.path.isfile(path):
+        return path
+    return None
 
 
-def segments_to_srt(segments: list) -> str:
-    blocks: list[str] = []
-    index = 1
-    for segment in segments:
-        if not isinstance(segment, dict):
-            continue
-        text = cue_text(segment)
-        if not text:
-            continue
-        start = float(segment.get("start", 0.0))
-        end = float(segment.get("end", start))
-        if end <= start:
-            end = start + 0.001
-        blocks.append(
-            f"{index}\n{format_timestamp(start)} --> {format_timestamp(end)}\n{text}\n"
+def write_srt(json_path: str | None, payload: dict | None, srt_path: str) -> int:
+    """Convert transcript JSON by running json_to_srt.py next to this script."""
+
+    converter = converter_path()
+    if converter is None:
+        print("json_to_srt.py was not found next to client.py", file=sys.stderr)
+        return 1
+    command = [sys.executable, converter, "--srt", srt_path, "--quiet"]
+    if json_path is not None:
+        command.append(json_path)
+        completed = subprocess.run(command)
+    else:
+        if not isinstance(payload, dict):
+            print("Response JSON is not an object", file=sys.stderr)
+            return 1
+        command.append("-")
+        completed = subprocess.run(
+            command,
+            input=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
         )
-        index += 1
-    if not blocks:
-        return ""
-    return "\n".join(blocks) + "\n"
+    if completed.returncode != 0:
+        return completed.returncode
+    with open(srt_path, encoding="utf-8") as handle:
+        srt = handle.read()
+    cue_count = len([block for block in srt.split("\n\n") if block.strip()])
+    language = payload.get("language") if isinstance(payload, dict) else None
+    speakers = payload.get("num_speakers") if isinstance(payload, dict) else None
+    print(
+        f"wrote {srt_path} ({cue_count} cues, language={language}, speakers={speakers})",
+        file=sys.stderr,
+    )
+    return 0
 
 
 def header_filename(path: str) -> str:
@@ -515,25 +518,7 @@ def main(argv: list[str]) -> int:
             )
         return 0
 
-    if not isinstance(payload, dict):
-        print("Response JSON is not an object", file=sys.stderr)
-        return 1
-    segments = payload.get("segments")
-    if not isinstance(segments, list):
-        print("Response JSON has no segments list", file=sys.stderr)
-        return 1
-    srt = segments_to_srt(segments)
-    if not srt:
-        print("No subtitle cues in the response", file=sys.stderr)
-        return 1
-    write_text(srt_path, srt)
-    cue_count = srt.count("\n\n") + 1 if srt.strip() else 0
-    print(
-        f"wrote {srt_path} ({cue_count} cues, language={payload.get('language')}, "
-        f"speakers={payload.get('num_speakers')})",
-        file=sys.stderr,
-    )
-    return 0
+    return write_srt(json_path, payload if isinstance(payload, dict) else None, srt_path)
 
 
 if __name__ == "__main__":
