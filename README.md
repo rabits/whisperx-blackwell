@@ -1,8 +1,8 @@
 # WhisperX on NVIDIA Blackwell (DGX Spark / GB10 / GB200)
 
-🐳 **Docker Image:** `docker pull mekopa/whisperx-blackwell:latest`
-
-[![Docker](https://img.shields.io/badge/docker-ready-blue.svg)](https://hub.docker.com/r/mekopa/whisperx-blackwell)
+Fork of original project: https://github.com/Mekopa/whisperx-blackwell with updates to build and
+work properly. It integrates client with srt builder, switches to community diarization and
+integrates faster-whisper hallucination suppressor.
 
 ## The Problem
 
@@ -37,28 +37,7 @@ This repository contains the **"Blackwell Bridge Patch"** - a surgical Dockerfil
 | Alignment | GPU ✓ | GPU ✓ | - |
 | Diarization | **CPU only** | **GPU ✓** | 115x |
 
-## Quick Start
-
-### Option 1: Pre-built Docker Image (Recommended)
-
-```bash
-# Pull the image
-docker pull mekopa/whisperx-blackwell:latest
-
-# Run the service
-docker run -d \
-  --name whisperx-gpu \
-  --gpus all \
-  --ipc=host \
-  -p 8003:8003 \
-  -v /path/to/audio:/data \
-  -e HF_TOKEN="your_huggingface_token" \
-  mekopa/whisperx-blackwell:latest
-```
-
-**Get your HF token:** https://huggingface.co/settings/tokens (needed for pyannote speaker diarization)
-
-### Option 2: Build from Source
+## Build & run
 
 ```bash
 # Clone the repo
@@ -66,7 +45,7 @@ git clone https://github.com/mekopa/whisperx-blackwell.git
 cd whisperx-blackwell
 
 # Build the image
-docker build -f Dockerfile.gpu -t whisperx-blackwell:latest .
+docker build -t whisperx-blackwell:latest .
 
 # Run it
 docker run -d \
@@ -74,9 +53,16 @@ docker run -d \
   --gpus all \
   --ipc=host \
   -p 8003:8003 \
-  -e HF_TOKEN="your_token" \
   whisperx-blackwell:latest
 ```
+
+Speaker diarization uses the public [pyannote-community/speaker-diarization-community-1](https://huggingface.co/pyannote-community/speaker-diarization-community-1)
+pipeline. WhisperX 3.8.5 would otherwise download the gated `pyannote/speaker-diarization-community-1`
+repo. A Hugging Face token is not required. Set `WHISPERX_DIARIZE_MODEL` to pick another pipeline,
+and pass `HF_TOKEN` only when that pipeline is gated.
+
+The image on Docker Hub is a previous build. The diarization mirror, the client, and hallucination
+filtering below are in this tree and take effect after a local `docker build`.
 
 ## Usage
 
@@ -94,30 +80,63 @@ Expected response:
   "device": "cuda",
   "diarization_device": "cuda",
   "gpu": "NVIDIA GB10",
-  "compute_capability": "SM_90"
+  "compute_capability": "SM_90",
+  "diarization_model": "pyannote-community/speaker-diarization-community-1"
 }
 ```
 
-### Transcribe Audio
+### Client
+
+`client.py` uploads one audio file and writes subtitles next to it. For `interview.mp3` the
+defaults are `interview.mp3.json` (the service JSON) and `interview.srt`. Each SRT cue keeps the
+speaker id:
+
+```
+1
+00:00:40,503 --> 00:00:43,044
+[SPEAKER_01]: Hello folks.
+```
+
+```bash
+./client.py --svc_url http://localhost:8003/ interview.mp3
+./client.py --svc_url http://localhost:8003/ --language ru interview.mp3
+```
+
+`--json` and `--srt` replace those paths. An empty path skips that file (`--json ''` keeps only the
+SRT). Other flags match the form fields: `--language`, `--num-speakers`, `--min-speakers`,
+`--max-speakers`, and `--timeout` (seconds; omitted means wait until the service finishes).
+
+By default the client also sends [`whisper-hallucinations-ru.lst`](whisper-hallucinations-ru.lst).
+The service drops a segment before alignment when the whole cue matches a line in that list.
+Matching ignores case and punctuation, so phrase is removed and never reaches the aligner. A longer
+sentence that merely contains one of those words is kept. `--hallucinations other.lst` uses another
+file. `--hallucinations ''` turns the filter off.
+
+The JSON response includes `dropped_hallucinations` with the removed cue texts. If the running
+image is older and ignores the form field, the client still strips the same phrases from the JSON
+and SRT it writes.
+
+### Transcribe with curl
 
 ```bash
 curl -X POST "http://localhost:8003/transcribe" \
   -F "file=@your_audio.mp3" \
-  -F "language=auto" \
+  -F "language=ru" \
+  -F "hallucinations=$(cat whisper-hallucinations-ru.lst)" \
   -o transcription.json
 ```
 
 Response includes:
 - Word-level timestamps
-- Speaker labels (SPEAKER_00, SPEAKER_01, etc.)
-- Confidence scores
+- Speaker labels (`SPEAKER_00`, `SPEAKER_01`, ...)
 - Language detection
+- `dropped_hallucinations` when a phrase list was sent
 
 ## Technical Details
 
 ### The Patches
 
-#### 1. PyTorch Capability Spoof (`Dockerfile.gpu` lines 88-99)
+#### 1. PyTorch Capability Spoof (`Dockerfile` lines 88-99)
 
 ```python
 # Forces get_device_capability() to return (9, 0) for SM_121
@@ -128,7 +147,7 @@ def get_device_capability(device=None):
     return (major, minor)
 ```
 
-#### 2. Torchaudio Jiterator Bypass (`Dockerfile.gpu` lines 113-118)
+#### 2. Torchaudio Jiterator Bypass (`Dockerfile` lines 113-118)
 
 ```python
 # OLD (crashes on SM_121):
@@ -156,24 +175,31 @@ spectrum = torch.sqrt(fft_result.real**2 + fft_result.imag**2)
 - PyTorch 2.6.0 (NVIDIA container 25.01)
 - WhisperX 3.8.5
 - Pyannote.audio 4.0.4
+- transformers 4.48.x (kept below 4.50; 5.x needs `huggingface-hub` 1.x, which WhisperX 3.8.5 cannot use)
+- scipy 1.15.1 and scikit-learn 1.6.1
 - CUDA 13.0
 - Python 3.12
+
+`torchcodec` is not installed. After pip, the image puts NVIDIA's CUDA torch and NumPy 1.x back,
+then selects the aarch64 OpenBLAS/LAPACK builds so diarization can link on DGX Spark.
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│  WhisperX Pipeline (GPU-Accelerated)                        │
-├─────────────────────────────────────────────────────────────┤
-│                                                             │
-│  Step 1: Whisper large-v3      → GPU (Blackwell/Hopper)     │
-│  Step 2: Wav2Vec2 alignment    → GPU (Blackwell/Hopper)     │
-│  Step 3: Pyannote diarization  → GPU (PATCHED!)             │
-│                                                             │
-│  Patches Applied:                                           │
-│  - SM_121 → SM_90 capability spoof                          │
-│  - Torchaudio jiterator bypass                              │
-└─────────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────┐
+│  WhisperX Pipeline (GPU-Accelerated)                      │
+├───────────────────────────────────────────────────────────┤
+│                                                           │
+│  Step 1: Whisper large-v3       → GPU (Blackwell/Hopper)  │
+│  Step 2: Drop hallucination cues, whole segment           │
+│  Step 3: Wav2Vec2 alignment     → GPU (Blackwell/Hopper)  │
+│  Step 4: Pyannote community-1   → GPU (public mirror)     │
+│                                                           │
+│  Patches Applied:                                         │
+│  - SM_121 → SM_90 capability spoof                        │
+│  - Torchaudio jiterator bypass                            │
+│  - OpenBLAS / LAPACK on aarch64                           │
+└───────────────────────────────────────────────────────────┘
 ```
 
 ## Known Limitations
@@ -222,7 +248,8 @@ Found this useful? Here's how to help:
 
 MIT License - Free to use, modify, and distribute.
 
-**Disclaimer:** This is a community patch for early-adopter hardware. Use at your own risk. Not affiliated with NVIDIA or WhisperX maintainers.
+**Disclaimer:** This is a community patch for early-adopter hardware. Use at your own risk. Not
+affiliated with NVIDIA or WhisperX maintainers.
 
 ---
 

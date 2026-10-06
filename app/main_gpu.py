@@ -70,6 +70,66 @@ diarize_pipeline = None
 device = "cuda" if torch.cuda.is_available() else "cpu"
 compute_type = "float16" if device == "cuda" else "int8"
 
+# WhisperX 3.8.5 defaults to pyannote/speaker-diarization-community-1, which
+# is gated. pyannote-community/speaker-diarization-community-1 is the same
+# pipeline (config plus segmentation, embedding, and PLDA weights) and is public.
+DIARIZE_MODEL = os.getenv(
+    "WHISPERX_DIARIZE_MODEL",
+    "pyannote-community/speaker-diarization-community-1",
+).strip() or "pyannote-community/speaker-diarization-community-1"
+
+
+def normalize_phrase(text: str) -> str:
+    """Casefold and drop punctuation so list entries match Whisper text."""
+
+    folded = text.casefold()
+    return " ".join(re.sub(r"[^\w\s]+", " ", folded, flags=re.UNICODE).split())
+
+
+def hallucination_keys(blob: str) -> tuple[set[str], set[str]]:
+    """Return normalized phrases and exact casefolded lines from a newline list."""
+
+    normalized: set[str] = set()
+    exact: set[str] = set()
+    for line in blob.splitlines():
+        raw = line.strip()
+        if not raw or raw.startswith("#"):
+            continue
+        exact.add(" ".join(raw.split()).casefold())
+        key = normalize_phrase(raw)
+        if key:
+            normalized.add(key)
+    return normalized, exact
+
+
+def is_hallucination(text: str, normalized: set[str], exact: set[str]) -> bool:
+    stripped = " ".join(str(text).split())
+    if not stripped:
+        return False
+    if stripped.casefold() in exact:
+        return True
+    key = normalize_phrase(stripped)
+    return bool(key) and key in normalized
+
+
+def drop_hallucination_segments(segments: list, blob: str) -> tuple[list, list[str]]:
+    """Remove segments whose whole text is a known hallucination phrase."""
+
+    if not blob.strip():
+        return segments, []
+    normalized, exact = hallucination_keys(blob)
+    if not normalized and not exact:
+        return segments, []
+    kept = []
+    dropped: list[str] = []
+    for segment in segments:
+        text = segment.get("text", "") if isinstance(segment, dict) else ""
+        if is_hallucination(text, normalized, exact):
+            dropped.append(" ".join(str(text).split()))
+            continue
+        kept.append(segment)
+    return kept, dropped
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -119,6 +179,7 @@ async def health():
         "device": device,
         "diarization_device": device,  # GPU diarization enabled!
         "model": "whisper-large-v3",
+        "diarization_model": DIARIZE_MODEL,
         "cuda_available": torch.cuda.is_available(),
         "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
         "compute_capability": f"SM_{cap[0]}{cap[1]}"
@@ -131,7 +192,8 @@ async def transcribe_audio(
     language: str = Form("auto"),
     num_speakers: int = Form(None),
     min_speakers: int = Form(None),
-    max_speakers: int = Form(None)
+    max_speakers: int = Form(None),
+    hallucinations: str = Form(""),
 ):
     """
     Transcribe audio file with GPU-accelerated speaker diarization.
@@ -166,6 +228,14 @@ async def transcribe_audio(
         language_detected = result["language"]
         logger.info(f"   Detected language: {language_detected}")
 
+        # Drop known Whisper hallucinations before alignment.
+        segments, dropped = drop_hallucination_segments(result.get("segments") or [], hallucinations)
+        result["segments"] = segments
+        if dropped:
+            logger.info(f"   Dropped {len(dropped)} hallucination segment(s) before alignment")
+            for phrase in dropped:
+                logger.info(f"   hallucination: {phrase}")
+
         # Step 2: Align (word-level timestamps)
         logger.info("⏱️  Step 2: Aligning word timestamps...")
         global align_model
@@ -175,23 +245,30 @@ async def transcribe_audio(
                 device=device
             )
 
-        result = whisperx.align(
-            result["segments"],
-            align_model[0],
-            align_model[1],
-            tmp_path,
-            device,
-            return_char_alignments=False
-        )
+        if result["segments"]:
+            result = whisperx.align(
+                result["segments"],
+                align_model[0],
+                align_model[1],
+                tmp_path,
+                device,
+                return_char_alignments=False
+            )
+        else:
+            logger.info("   No segments left to align")
+            result["word_segments"] = []
 
         # Step 3: Diarization (speaker identification) - GPU ACCELERATED!
         diarize_device = device  # Use GPU!
-        logger.info(f"👥 Step 3: Identifying speakers (device: {diarize_device}) - GPU ACCELERATED!")
+        logger.info(
+            f"👥 Step 3: Identifying speakers (device: {diarize_device}, model: {DIARIZE_MODEL}) - GPU ACCELERATED!"
+        )
         global diarize_pipeline
         if diarize_pipeline is None:
             diarize_pipeline = whisperx.diarize.DiarizationPipeline(
-                token=os.getenv("HF_TOKEN"),
-                device=diarize_device
+                model_name=DIARIZE_MODEL,
+                token=os.getenv("HF_TOKEN") or None,
+                device=diarize_device,
             )
 
         # Run diarization
@@ -225,7 +302,8 @@ async def transcribe_audio(
             "word_segments": result.get("word_segments", []),
             "speakers": speakers,
             "num_speakers": len(speakers),
-            "diarization_device": diarize_device  # Confirm GPU was used
+            "diarization_device": diarize_device,  # Confirm GPU was used
+            "dropped_hallucinations": dropped,
         }
 
     except Exception as e:

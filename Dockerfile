@@ -70,12 +70,12 @@ RUN pip install --no-cache-dir \
     "pyannote.audio==4.0.4" \
     "python-multipart==0.0.26" \
     "semver==3.0.4" \
-    "torchcodec==0.11.1" \
-    "transformers<5.0.0" \
+    "transformers>=4.48.0,<4.50.0" \
+    "scipy==1.15.1" \
+    "scikit-learn==1.6.1" \
     "uvicorn[standard]==0.44.0" \
     "whisperx==3.8.5"
 
-# Restore NVIDIA's torch, numpy, and custom torchaudio/torio if pip overwrote them
 RUN rm -rf /usr/local/lib/python3.12/dist-packages/torch && \
     rm -rf /usr/local/lib/python3.12/dist-packages/torchvision && \
     rm -rf /usr/local/lib/python3.12/dist-packages/torchaudio && \
@@ -88,7 +88,7 @@ RUN rm -rf /usr/local/lib/python3.12/dist-packages/torch && \
     mv /tmp/torio_custom /usr/local/lib/python3.12/dist-packages/torio && \
     mv /tmp/numpy_nvidia /usr/local/lib/python3.12/dist-packages/numpy && \
     mv /tmp/numpy_libs_nvidia /usr/local/lib/python3.12/dist-packages/numpy.libs 2>/dev/null || true && \
-    echo "Restored NVIDIA CUDA torch, numpy, and custom torchaudio/torio for Blackwell GPU support"
+    echo "Restored NVIDIA CUDA torch + NumPy 1.x"
 
 # === NUCLEAR PATCH: Force SM_90 (Hopper) for SM_121 (Blackwell) ===
 # The nvrtc compiler doesn't recognize SM_121 yet, but SM_90 code runs on Blackwell
@@ -122,6 +122,17 @@ RUN sed -i 's/spectrum = torch.fft.rfft(strided_input).abs()/# BLACKWELL PATCH: 
     echo "=== TORCHAUDIO FBANK PATCH APPLIED ===" && \
     echo "Complex abs() now computed manually to avoid jiterator crash"
 # === END NUCLEAR PATCH ===
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libopenblas0-pthread libopenblas-dev \
+        liblapack3 liblapack-dev libblas3 \
+    && rm -rf /var/lib/apt/lists/* \
+    && (update-alternatives --set liblapack.so.3-aarch64-linux-gnu \
+            /usr/lib/aarch64-linux-gnu/lapack/liblapack.so.3 || true) \
+    && (update-alternatives --set libblas.so.3-aarch64-linux-gnu \
+            /usr/lib/aarch64-linux-gnu/blas/libblas.so.3 || true)
+
+ENV LD_LIBRARY_PATH=/usr/lib/aarch64-linux-gnu/lapack:/usr/lib/aarch64-linux-gnu/blas:${LD_LIBRARY_PATH}
 
 # Copy application
 COPY app/ /app/app/
