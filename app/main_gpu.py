@@ -11,7 +11,13 @@ Built from source to support ARM64 + Blackwell (SM_121) architecture.
 """
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
+import asyncio
+import queue
+import threading
+import time
+import uuid
 import torch
 import re
 
@@ -131,6 +137,224 @@ def drop_hallucination_segments(segments: list, blob: str) -> tuple[list, list[s
     return kept, dropped
 
 
+# One GPU job at a time. POST /transcribe returns immediately; the worker
+# updates per-stage percents that GET /progress/{uid} reports.
+STAGES = ("transcribe", "align", "diarize", "assign")
+STAGE_LABELS = {
+    "transcribe": "Transcribing",
+    "align": "Aligning",
+    "diarize": "Identifying speakers",
+    "assign": "Assigning speakers",
+}
+
+_jobs_lock = threading.Lock()
+_jobs: dict[str, "Job"] = {}
+_job_queue: "queue.Queue[str]" = queue.Queue()
+_worker_started = False
+
+
+class Job:
+    def __init__(self, uid: str, tmp_path: str, filename: str, language: str,
+                 num_speakers, min_speakers, max_speakers, hallucinations: str):
+        self.uid = uid
+        self.tmp_path = tmp_path
+        self.filename = filename
+        self.language = language
+        self.num_speakers = num_speakers
+        self.min_speakers = min_speakers
+        self.max_speakers = max_speakers
+        self.hallucinations = hallucinations
+        self.status = "queued"
+        self.stage = "transcribe"
+        self.percents = {name: 0.0 for name in STAGES}
+        self.detail = None
+        self.result = None
+        self.updated = time.time()
+
+    def mark(self, stage: str, percent: float) -> None:
+        with _jobs_lock:
+            if self.status == "error":
+                return
+            self.status = "running"
+            self.stage = stage
+            index = STAGES.index(stage)
+            for name in STAGES[:index]:
+                self.percents[name] = 100.0
+            value = max(0.0, min(100.0, float(percent)))
+            self.percents[stage] = max(self.percents[stage], value)
+            self.updated = time.time()
+
+    def finish(self, result: dict) -> None:
+        with _jobs_lock:
+            for name in STAGES:
+                self.percents[name] = 100.0
+            self.stage = STAGES[-1]
+            self.result = result
+            self.status = "done"
+            self.updated = time.time()
+
+    def fail(self, exc: BaseException) -> None:
+        with _jobs_lock:
+            self.status = "error"
+            self.detail = str(exc)
+            self.updated = time.time()
+
+    def snapshot(self) -> dict:
+        with _jobs_lock:
+            return {
+                "uid": self.uid,
+                "status": self.status,
+                "stage": self.stage,
+                "filename": self.filename,
+                "stages": [
+                    {
+                        "name": name,
+                        "label": STAGE_LABELS[name],
+                        "percent": round(self.percents[name], 1),
+                    }
+                    for name in STAGES
+                ],
+                "detail": self.detail,
+            }
+
+
+def _evict_finished() -> None:
+    with _jobs_lock:
+        finished = [job for job in _jobs.values() if job.status in {"done", "error"}]
+        if len(finished) <= 10:
+            return
+        finished.sort(key=lambda job: job.updated)
+        for job in finished[:-10]:
+            _jobs.pop(job.uid, None)
+
+
+def _run_job(job: Job) -> None:
+    global align_model, diarize_pipeline
+
+    job.mark("transcribe", 0)
+    logger.info("🎤 %s transcribing %s", job.uid, job.filename)
+    result = whisperx_model.transcribe(
+        job.tmp_path,
+        batch_size=16,
+        language=None if job.language == "auto" else job.language,
+        progress_callback=lambda percent: job.mark("transcribe", percent),
+    )
+    job.mark("transcribe", 100)
+
+    language_detected = result["language"]
+    logger.info("   Detected language: %s", language_detected)
+
+    segments, dropped = drop_hallucination_segments(result.get("segments") or [], job.hallucinations)
+    result["segments"] = segments
+    if dropped:
+        logger.info("   Dropped %s hallucination segment(s) before alignment", len(dropped))
+        for phrase in dropped:
+            logger.info("   hallucination: %s", phrase)
+
+    job.mark("align", 0)
+    logger.info("⏱️  %s aligning", job.uid)
+    if align_model is None or align_model[1] != language_detected:
+        align_model = whisperx.load_align_model(language_code=language_detected, device=device)
+    if result["segments"]:
+        result = whisperx.align(
+            result["segments"],
+            align_model[0],
+            align_model[1],
+            job.tmp_path,
+            device,
+            return_char_alignments=False,
+            progress_callback=lambda percent: job.mark("align", percent),
+        )
+    else:
+        logger.info("   No segments left to align")
+        result["word_segments"] = []
+    job.mark("align", 100)
+
+    job.mark("diarize", 0)
+    logger.info("👥 %s diarizing with %s", job.uid, DIARIZE_MODEL)
+    if diarize_pipeline is None:
+        diarize_pipeline = whisperx.diarize.DiarizationPipeline(
+            model_name=DIARIZE_MODEL,
+            token=os.getenv("HF_TOKEN") or None,
+            device=device,
+        )
+    diarize_segments = diarize_pipeline(
+        job.tmp_path,
+        num_speakers=job.num_speakers,
+        min_speakers=job.min_speakers,
+        max_speakers=job.max_speakers,
+        progress_callback=lambda percent: job.mark("diarize", percent),
+    )
+    job.mark("diarize", 100)
+
+    job.mark("assign", 0)
+    logger.info("🔗 %s assigning speakers", job.uid)
+    result = whisperx.assign_word_speakers(diarize_segments, result)
+    job.mark("assign", 100)
+
+    speakers = {}
+    for segment in result["segments"]:
+        speaker = segment.get("speaker", "UNKNOWN")
+        bucket = speakers.setdefault(speaker, {"duration": 0, "segments": 0})
+        bucket["duration"] += segment["end"] - segment["start"]
+        bucket["segments"] += 1
+
+    job.finish({
+        "status": "success",
+        "uid": job.uid,
+        "language": language_detected,
+        "segments": result["segments"],
+        "word_segments": result.get("word_segments", []),
+        "speakers": speakers,
+        "num_speakers": len(speakers),
+        "diarization_device": device,
+        "dropped_hallucinations": dropped,
+    })
+    logger.info("✅ %s complete", job.uid)
+
+
+def _job_worker() -> None:
+    while True:
+        uid = _job_queue.get()
+        with _jobs_lock:
+            job = _jobs.get(uid)
+        if job is None:
+            continue
+        try:
+            _run_job(job)
+        except Exception as exc:
+            logger.exception("job %s failed", uid)
+            job.fail(exc)
+        finally:
+            if job.tmp_path and os.path.exists(job.tmp_path):
+                os.remove(job.tmp_path)
+            gc.collect()
+            if device == "cuda":
+                torch.cuda.empty_cache()
+            _evict_finished()
+
+
+def _ensure_worker() -> None:
+    global _worker_started
+    with _jobs_lock:
+        if _worker_started:
+            return
+        threading.Thread(target=_job_worker, name="whisperx-jobs", daemon=True).start()
+        _worker_started = True
+
+
+def _job_or_404(uid: str) -> Job:
+    try:
+        uuid.UUID(uid)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail="Unknown job") from exc
+    with _jobs_lock:
+        job = _jobs.get(uid)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Unknown job")
+    return job
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Load models on startup"""
@@ -155,6 +379,7 @@ async def lifespan(app: FastAPI):
     )
 
     logger.info("✅ WhisperX ready for GPU-accelerated batch processing!")
+    _ensure_worker()
 
     yield
 
@@ -194,131 +419,70 @@ async def transcribe_audio(
     min_speakers: int = Form(None),
     max_speakers: int = Form(None),
     hallucinations: str = Form(""),
+    wait: bool = Form(False),
 ):
-    """
-    Transcribe audio file with GPU-accelerated speaker diarization.
+    """Queue one audio file and return its job id.
 
-    Args:
-        file: Audio file (WAV, MP3, M4A, etc.)
-        language: Language code or "auto" for detection
-        num_speakers: Exact number of speakers (if known)
-        min_speakers: Minimum speakers (if uncertain)
-        max_speakers: Maximum speakers (if uncertain)
-
-    Returns:
-        Transcript with speaker labels and word-level timestamps
+    The transcript is fetched later from GET /result/{uid}. Pass wait=true to
+    block until that transcript is ready, which is the previous response shape.
     """
     logger.info(f"📥 Received file: {file.filename}")
-
-    # Save uploaded file
-    with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1]) as tmp:
-        content = await file.read()
-        tmp.write(content)
+    _ensure_worker()
+    suffix = os.path.splitext(file.filename or "")[1]
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        tmp.write(await file.read())
         tmp_path = tmp.name
 
-    try:
-        # Step 1: Transcribe with WhisperX
-        logger.info("🎤 Step 1: Transcribing audio...")
-        result = whisperx_model.transcribe(
-            tmp_path,
-            batch_size=16,
-            language=None if language == "auto" else language
-        )
+    job = Job(
+        uid=str(uuid.uuid4()),
+        tmp_path=tmp_path,
+        filename=file.filename or os.path.basename(tmp_path),
+        language=language,
+        num_speakers=num_speakers,
+        min_speakers=min_speakers,
+        max_speakers=max_speakers,
+        hallucinations=hallucinations,
+    )
+    with _jobs_lock:
+        _jobs[job.uid] = job
+    _job_queue.put(job.uid)
 
-        language_detected = result["language"]
-        logger.info(f"   Detected language: {language_detected}")
+    if wait:
+        while True:
+            snap = job.snapshot()
+            if snap["status"] == "done":
+                return job.result
+            if snap["status"] == "error":
+                raise HTTPException(status_code=500, detail=snap["detail"])
+            await asyncio.sleep(0.25)
 
-        # Drop known Whisper hallucinations before alignment.
-        segments, dropped = drop_hallucination_segments(result.get("segments") or [], hallucinations)
-        result["segments"] = segments
-        if dropped:
-            logger.info(f"   Dropped {len(dropped)} hallucination segment(s) before alignment")
-            for phrase in dropped:
-                logger.info(f"   hallucination: {phrase}")
+    return JSONResponse(
+        status_code=202,
+        content={
+            "uid": job.uid,
+            "status": "queued",
+            "progress": f"/progress/{job.uid}",
+            "result": f"/result/{job.uid}",
+        },
+    )
 
-        # Step 2: Align (word-level timestamps)
-        logger.info("⏱️  Step 2: Aligning word timestamps...")
-        global align_model
-        if align_model is None or align_model[1] != language_detected:
-            align_model = whisperx.load_align_model(
-                language_code=language_detected,
-                device=device
-            )
 
-        if result["segments"]:
-            result = whisperx.align(
-                result["segments"],
-                align_model[0],
-                align_model[1],
-                tmp_path,
-                device,
-                return_char_alignments=False
-            )
-        else:
-            logger.info("   No segments left to align")
-            result["word_segments"] = []
+@app.get("/progress/{uid}")
+async def job_progress(uid: str):
+    """Percent complete for each stage of one queued transcription."""
+    return _job_or_404(uid).snapshot()
 
-        # Step 3: Diarization (speaker identification) - GPU ACCELERATED!
-        diarize_device = device  # Use GPU!
-        logger.info(
-            f"👥 Step 3: Identifying speakers (device: {diarize_device}, model: {DIARIZE_MODEL}) - GPU ACCELERATED!"
-        )
-        global diarize_pipeline
-        if diarize_pipeline is None:
-            diarize_pipeline = whisperx.diarize.DiarizationPipeline(
-                model_name=DIARIZE_MODEL,
-                token=os.getenv("HF_TOKEN") or None,
-                device=diarize_device,
-            )
 
-        # Run diarization
-        diarize_segments = diarize_pipeline(
-            tmp_path,
-            num_speakers=num_speakers,
-            min_speakers=min_speakers,
-            max_speakers=max_speakers
-        )
-
-        # Step 4: Assign speakers to words
-        logger.info("🔗 Step 4: Assigning speakers to words...")
-        result = whisperx.assign_word_speakers(diarize_segments, result)
-
-        # Format response
-        logger.info("✅ Processing complete!")
-
-        # Extract speaker stats
-        speakers = {}
-        for segment in result["segments"]:
-            speaker = segment.get("speaker", "UNKNOWN")
-            if speaker not in speakers:
-                speakers[speaker] = {"duration": 0, "segments": 0}
-            speakers[speaker]["duration"] += segment["end"] - segment["start"]
-            speakers[speaker]["segments"] += 1
-
-        return {
-            "status": "success",
-            "language": language_detected,
-            "segments": result["segments"],
-            "word_segments": result.get("word_segments", []),
-            "speakers": speakers,
-            "num_speakers": len(speakers),
-            "diarization_device": diarize_device,  # Confirm GPU was used
-            "dropped_hallucinations": dropped,
-        }
-
-    except Exception as e:
-        logger.error(f"❌ Processing error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-    finally:
-        # Cleanup
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
-
-        # Free GPU memory
-        gc.collect()
-        if device == "cuda":
-            torch.cuda.empty_cache()
+@app.get("/result/{uid}")
+async def job_result(uid: str):
+    """Transcript for a finished job. 202 while it is still running."""
+    job = _job_or_404(uid)
+    snap = job.snapshot()
+    if snap["status"] in {"queued", "running"}:
+        return JSONResponse(status_code=202, content=snap)
+    if snap["status"] == "error":
+        raise HTTPException(status_code=500, detail=snap["detail"])
+    return job.result
 
 
 @app.get("/")
@@ -329,10 +493,13 @@ async def root():
         "version": "1.1.0-gpu",
         "platform": "NVIDIA DGX Spark (Blackwell)",
         "endpoint": "POST /transcribe",
+        "progress": "GET /progress/{uid}",
+        "result": "GET /result/{uid}",
         "features": [
             "Perfect transcription (Whisper large-v3)",
             "Word-level timestamps (Wav2Vec2 alignment)",
             "Speaker diarization (pyannote.audio) - GPU ACCELERATED",
+            "Per-stage progress by job id",
             "Full GPU acceleration (Blackwell SM_121 → SM_90 spoof)"
         ]
     }

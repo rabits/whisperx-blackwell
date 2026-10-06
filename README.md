@@ -102,9 +102,26 @@ speaker id:
 ./client.py --svc_url http://localhost:8003/ --language ru interview.mp3
 ```
 
+`POST /transcribe` answers with a job id. The client then polls `GET /progress/{uid}`
+and prints each stage as it moves, in 5% steps:
+
+```
+job 3f1c0a2e-1b4d-4e7a-9c20-6a8f0e5d2b11
+queued
+Transcribing              0.0%
+Transcribing             40.0%
+Transcribing            100.0%
+Aligning                 15.0%
+Aligning                100.0%
+Identifying speakers     50.0%
+Identifying speakers    100.0%
+Assigning speakers      100.0%
+```
+
 `--json` and `--srt` replace those paths. An empty path skips that file (`--json ''` keeps only the
 SRT). Other flags match the form fields: `--language`, `--num-speakers`, `--min-speakers`,
-`--max-speakers`, and `--timeout` (seconds; omitted means wait until the service finishes).
+`--max-speakers`, and `--timeout` (seconds to wait for the job after the upload; omitted means
+wait until the service finishes).
 
 By default the client also sends [`whisper-hallucinations-ru.lst`](whisper-hallucinations-ru.lst).
 The service drops a segment before alignment when the whole cue matches a line in that list.
@@ -119,18 +136,36 @@ and SRT it writes.
 ### Transcribe with curl
 
 ```bash
+curl -s -X POST "http://localhost:8003/transcribe" \
+  -F "file=@your_audio.mp3" \
+  -F "language=ru" \
+  -F "hallucinations=$(cat whisper-hallucinations-ru.lst)"
+# {"uid":"...","status":"queued","progress":"/progress/...","result":"/result/..."}
+
+curl -s "http://localhost:8003/progress/UID"
+curl -s "http://localhost:8003/result/UID" -o transcription.json
+```
+
+`GET /progress/{uid}` reports `queued`, `running`, `done`, or `error`, plus a percent for
+`transcribe`, `align`, `diarize`, and `assign`. `GET /result/{uid}` is the transcript once
+`status` is `done`, and `202` with the same progress object while the job is still running.
+
+`wait=true` blocks the POST until the transcript is ready and returns that JSON directly:
+
+```bash
 curl -X POST "http://localhost:8003/transcribe" \
   -F "file=@your_audio.mp3" \
   -F "language=ru" \
-  -F "hallucinations=$(cat whisper-hallucinations-ru.lst)" \
+  -F "wait=true" \
   -o transcription.json
 ```
 
-Response includes:
+The transcript includes:
 - Word-level timestamps
 - Speaker labels (`SPEAKER_00`, `SPEAKER_01`, ...)
 - Language detection
 - `dropped_hallucinations` when a phrase list was sent
+- `uid` of the job
 
 ## Technical Details
 

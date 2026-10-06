@@ -18,6 +18,7 @@ import json
 import os
 import re
 import sys
+import time
 import uuid
 from http.client import HTTPConnection, HTTPSConnection
 from urllib.parse import urlparse
@@ -27,7 +28,7 @@ def default_output(audio_path: str, suffix: str) -> str:
     return audio_path + suffix
 
 
-def endpoint_url(svc_url: str) -> str:
+def service_root(svc_url: str) -> str:
     """Accept a service root or a full /transcribe URL."""
 
     raw = svc_url.strip()
@@ -39,10 +40,45 @@ def endpoint_url(svc_url: str) -> str:
     if not parsed.netloc:
         raise SystemExit(f"Not a usable service URL: {svc_url}")
     path = parsed.path.rstrip("/")
-    if path.endswith("/transcribe"):
-        return parsed._replace(path=path, params="", query="", fragment="").geturl()
-    base = parsed._replace(path=path + "/", params="", query="", fragment="").geturl()
-    return base + "transcribe"
+    for suffix in ("/transcribe", "/progress", "/result"):
+        if path.endswith(suffix):
+            path = path[: -len(suffix)]
+            break
+    return parsed._replace(path=path, params="", query="", fragment="").geturl().rstrip("/")
+
+
+def endpoint_url(svc_url: str) -> str:
+    return service_root(svc_url) + "/transcribe"
+
+
+def progress_log_lines(progress: dict, seen: dict) -> list[str]:
+    """New execution-log lines since the previous poll.
+
+    seen maps a stage name to the last 5% bucket that was printed.
+    """
+
+    status = progress.get("status")
+    if status == "queued":
+        if seen.get("_queued") == 1:
+            return []
+        seen["_queued"] = 1
+        return ["queued"]
+    lines = []
+    current = progress.get("stage")
+    for stage in progress.get("stages") or []:
+        if not isinstance(stage, dict):
+            continue
+        name = str(stage.get("name") or "")
+        label = str(stage.get("label") or name)
+        percent = float(stage.get("percent") or 0)
+        if percent <= 0 and name != current:
+            continue
+        bucket = 100 if percent >= 100 else int(percent // 5) * 5
+        if seen.get(name) == bucket:
+            continue
+        seen[name] = bucket
+        lines.append(f"{label:<22} {percent:6.1f}%")
+    return lines
 
 
 def format_timestamp(seconds: float) -> str:
@@ -246,6 +282,69 @@ def post_audio(url: str, audio_path: str, fields: dict[str, str], timeout: float
         connection.close()
 
 
+def http_request(method: str, url: str, timeout: float | None) -> tuple[int, bytes]:
+    parsed = urlparse(url)
+    connection_cls = HTTPSConnection if parsed.scheme == "https" else HTTPConnection
+    path = parsed.path or "/"
+    if parsed.query:
+        path = path + "?" + parsed.query
+    connection = connection_cls(parsed.hostname, parsed.port, timeout=timeout)
+    try:
+        connection.request(method, path)
+        response = connection.getresponse()
+        return response.status, response.read()
+    finally:
+        connection.close()
+
+
+def poll_until_done(root: str, uid: str, deadline: float | None) -> bytes:
+    """Print per-stage percents, then return the finished transcript body."""
+
+    seen: dict = {}
+    while True:
+        if deadline is not None and time.monotonic() > deadline:
+            print(f"Timed out waiting for job {uid}", file=sys.stderr)
+            raise SystemExit(1)
+        try:
+            status, body = http_request("GET", f"{root}/progress/{uid}", 30)
+        except OSError as exc:
+            print(f"Progress request failed: {exc}", file=sys.stderr)
+            raise SystemExit(1) from exc
+        if status != 200:
+            detail = body.decode("utf-8", errors="replace").strip()
+            print(f"Progress returned HTTP {status}", file=sys.stderr)
+            if detail:
+                print(detail, file=sys.stderr)
+            raise SystemExit(1)
+        try:
+            progress = json.loads(body)
+        except json.JSONDecodeError as exc:
+            print(f"Progress response is not JSON: {exc}", file=sys.stderr)
+            raise SystemExit(1) from exc
+        for line in progress_log_lines(progress, seen):
+            print(line, file=sys.stderr)
+        state = progress.get("status")
+        if state == "done":
+            break
+        if state == "error":
+            print(progress.get("detail") or "Job failed", file=sys.stderr)
+            raise SystemExit(1)
+        time.sleep(0.5)
+
+    try:
+        status, body = http_request("GET", f"{root}/result/{uid}", 120)
+    except OSError as exc:
+        print(f"Result request failed: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
+    if status != 200:
+        detail = body.decode("utf-8", errors="replace").strip()
+        print(f"Result returned HTTP {status}", file=sys.stderr)
+        if detail:
+            print(detail, file=sys.stderr)
+        raise SystemExit(1)
+    return body
+
+
 def write_text(path: str, content: str) -> None:
     parent = os.path.dirname(os.path.abspath(path))
     os.makedirs(parent, exist_ok=True)
@@ -288,7 +387,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--timeout",
         type=float,
         default=None,
-        help="Socket timeout in seconds for the whole request. Default: wait until the service finishes.",
+        help="Seconds to wait for the job after the upload. Default: wait until the service finishes.",
     )
     parser.add_argument(
         "--hallucinations",
@@ -349,13 +448,31 @@ def main(argv: list[str]) -> int:
         f"hallucinations={len(exact)})",
         file=sys.stderr,
     )
+    # The upload itself should not use the whole-job deadline as a socket timeout.
     try:
-        status, body = post_audio(url, audio_path, fields, args.timeout)
+        status, body = post_audio(url, audio_path, fields, None)
     except OSError as exc:
         print(f"Request failed: {exc}", file=sys.stderr)
         return 1
 
-    if status != 200:
+    if status == 202:
+        try:
+            accepted = json.loads(body)
+        except json.JSONDecodeError as exc:
+            print(f"Accepted response is not JSON: {exc}", file=sys.stderr)
+            return 1
+        uid = accepted.get("uid")
+        if not uid:
+            print("Accepted response has no uid", file=sys.stderr)
+            return 1
+        print(f"job {uid}", file=sys.stderr)
+        deadline = None if args.timeout is None else time.monotonic() + args.timeout
+        try:
+            body = poll_until_done(service_root(args.svc_url), uid, deadline)
+        except SystemExit as exc:
+            return int(exc.code) if isinstance(exc.code, int) else 1
+        status = 200
+    elif status != 200:
         detail = body.decode("utf-8", errors="replace").strip()
         print(f"Service returned HTTP {status}", file=sys.stderr)
         if detail:
