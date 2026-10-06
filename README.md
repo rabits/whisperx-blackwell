@@ -37,6 +37,34 @@ This repository contains the **"Blackwell Bridge Patch"** - a surgical Dockerfil
 | Alignment | GPU ✓ | GPU ✓ | - |
 | Diarization | **CPU only** | **GPU ✓** | 115x |
 
+Processing 01h46m57s audio:
+```
+11:47:59 POST http://localhost:8003/transcribe (111293115 bytes, language=auto, hallucinations=69)
+11:48:00 job 21b0b500-3ff8-4d18-9656-b88185e9fb84
+11:48:00 Transcribing              0.0%
+11:49:03 Transcribing              5.7%
+11:49:27 Transcribing             11.5%
+...
+11:55:45 Transcribing             97.5%
+11:56:04 Transcribing            100.0%
+11:56:04 Aligning                  0.0%
+11:56:42 Aligning                  5.0%
+11:56:47 Aligning                 10.4%
+...
+11:58:14 Aligning                 95.3%
+11:58:18 Aligning                100.0%
+11:58:18 Identifying speakers      0.0%
+11:58:37 Identifying speakers      6.7%
+11:58:38 Identifying speakers     11.0%
+...
+12:02:22 Identifying speakers     95.0%
+12:02:45 Identifying speakers    100.0%
+12:02:45 Assigning speakers      100.0%
+12:02:45 wrote out.webm.json
+12:02:45 wrote out.srt (1188 cues, language=ru, speakers=1)
+```
+**Result:** Total: 14m45s, processing speed: ~7.31x
+
 ## Build & run
 
 ```bash
@@ -108,16 +136,17 @@ speaker id:
 and prints each stage as it moves, in 5% steps:
 
 ```
-job 3f1c0a2e-1b4d-4e7a-9c20-6a8f0e5d2b11
-queued
-Transcribing              0.0%
-Transcribing             40.0%
-Transcribing            100.0%
-Aligning                 15.0%
-Aligning                100.0%
-Identifying speakers     50.0%
-Identifying speakers    100.0%
-Assigning speakers      100.0%
+11:26:01 POST http://localhost:8003/transcribe (1048576 bytes, language=ru, hallucinations=69)
+11:26:02 job 3f1c0a2e-1b4d-4e7a-9c20-6a8f0e5d2b11
+11:26:02 queued
+11:26:03 Transcribing              0.0%
+11:26:18 Transcribing             40.0%
+11:26:41 Transcribing            100.0%
+11:26:42 Aligning                 15.0%
+11:27:05 Aligning                100.0%
+11:27:20 Identifying speakers     50.0%
+11:27:48 Identifying speakers    100.0%
+11:27:48 Assigning speakers      100.0%
 ```
 
 `--json` and `--srt` replace those paths. An empty path skips that file (`--json ''` keeps only the

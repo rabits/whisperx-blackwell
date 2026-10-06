@@ -30,6 +30,15 @@ def default_output(audio_path: str, suffix: str) -> str:
     return audio_path + suffix
 
 
+def log(message: str) -> None:
+    """Write one client log line, prefixed with the local time."""
+
+    stamp = time.strftime("%H:%M:%S")
+    lines = str(message).splitlines() or [""]
+    for line in lines:
+        print(f"{stamp} {line}", file=sys.stderr)
+
+
 def service_root(svc_url: str) -> str:
     """Accept a service root or a full /transcribe URL."""
 
@@ -195,7 +204,7 @@ def write_srt(json_path: str | None, payload: dict | None, srt_path: str) -> int
 
     converter = converter_path()
     if converter is None:
-        print("json_to_srt.py was not found next to client.py", file=sys.stderr)
+        log("json_to_srt.py was not found next to client.py")
         return 1
     command = [sys.executable, converter, "--srt", srt_path, "--quiet"]
     if json_path is not None:
@@ -203,7 +212,7 @@ def write_srt(json_path: str | None, payload: dict | None, srt_path: str) -> int
         completed = subprocess.run(command)
     else:
         if not isinstance(payload, dict):
-            print("Response JSON is not an object", file=sys.stderr)
+            log("Response JSON is not an object")
             return 1
         command.append("-")
         completed = subprocess.run(
@@ -217,10 +226,7 @@ def write_srt(json_path: str | None, payload: dict | None, srt_path: str) -> int
     cue_count = len([block for block in srt.split("\n\n") if block.strip()])
     language = payload.get("language") if isinstance(payload, dict) else None
     speakers = payload.get("num_speakers") if isinstance(payload, dict) else None
-    print(
-        f"wrote {srt_path} ({cue_count} cues, language={language}, speakers={speakers})",
-        file=sys.stderr,
-    )
+    log(f"wrote {srt_path} ({cue_count} cues, language={language}, speakers={speakers})")
     return 0
 
 
@@ -306,44 +312,44 @@ def poll_until_done(root: str, uid: str, deadline: float | None) -> bytes:
     seen: dict = {}
     while True:
         if deadline is not None and time.monotonic() > deadline:
-            print(f"Timed out waiting for job {uid}", file=sys.stderr)
+            log(f"Timed out waiting for job {uid}")
             raise SystemExit(1)
         try:
             status, body = http_request("GET", f"{root}/progress/{uid}", 30)
         except OSError as exc:
-            print(f"Progress request failed: {exc}", file=sys.stderr)
+            log(f"Progress request failed: {exc}")
             raise SystemExit(1) from exc
         if status != 200:
             detail = body.decode("utf-8", errors="replace").strip()
-            print(f"Progress returned HTTP {status}", file=sys.stderr)
+            log(f"Progress returned HTTP {status}")
             if detail:
-                print(detail, file=sys.stderr)
+                log(detail)
             raise SystemExit(1)
         try:
             progress = json.loads(body)
         except json.JSONDecodeError as exc:
-            print(f"Progress response is not JSON: {exc}", file=sys.stderr)
+            log(f"Progress response is not JSON: {exc}")
             raise SystemExit(1) from exc
         for line in progress_log_lines(progress, seen):
-            print(line, file=sys.stderr)
+            log(line)
         state = progress.get("status")
         if state == "done":
             break
         if state == "error":
-            print(progress.get("detail") or "Job failed", file=sys.stderr)
+            log(progress.get("detail") or "Job failed")
             raise SystemExit(1)
         time.sleep(0.5)
 
     try:
         status, body = http_request("GET", f"{root}/result/{uid}", 120)
     except OSError as exc:
-        print(f"Result request failed: {exc}", file=sys.stderr)
+        log(f"Result request failed: {exc}")
         raise SystemExit(1) from exc
     if status != 200:
         detail = body.decode("utf-8", errors="replace").strip()
-        print(f"Result returned HTTP {status}", file=sys.stderr)
+        log(f"Result returned HTTP {status}")
         if detail:
-            print(detail, file=sys.stderr)
+            log(detail)
         raise SystemExit(1)
     return body
 
@@ -416,7 +422,7 @@ def main(argv: list[str]) -> int:
     args = parse_args(argv)
     audio_path = args.audio
     if not os.path.isfile(audio_path):
-        print(f"Audio file not found: {audio_path}", file=sys.stderr)
+        log(f"Audio file not found: {audio_path}")
         return 1
 
     json_path = resolved_path(args.json, audio_path, ".json")
@@ -430,7 +436,7 @@ def main(argv: list[str]) -> int:
     hallucination_blob = ""
     if hallucinations_path is not None:
         if not os.path.isfile(hallucinations_path):
-            print(f"Hallucination list not found: {hallucinations_path}", file=sys.stderr)
+            log(f"Hallucination list not found: {hallucinations_path}")
             return 1
         with open(hallucinations_path, encoding="utf-8") as handle:
             hallucination_blob = handle.read()
@@ -446,29 +452,28 @@ def main(argv: list[str]) -> int:
         fields["hallucinations"] = hallucination_blob
 
     exact = hallucination_keys(hallucination_blob)[1] if hallucination_blob.strip() else set()
-    print(
+    log(
         f"POST {url} ({os.path.getsize(audio_path)} bytes, language={args.language}, "
-        f"hallucinations={len(exact)})",
-        file=sys.stderr,
+        f"hallucinations={len(exact)})"
     )
     # The upload itself should not use the whole-job deadline as a socket timeout.
     try:
         status, body = post_audio(url, audio_path, fields, None)
     except OSError as exc:
-        print(f"Request failed: {exc}", file=sys.stderr)
+        log(f"Request failed: {exc}")
         return 1
 
     if status == 202:
         try:
             accepted = json.loads(body)
         except json.JSONDecodeError as exc:
-            print(f"Accepted response is not JSON: {exc}", file=sys.stderr)
+            log(f"Accepted response is not JSON: {exc}")
             return 1
         uid = accepted.get("uid")
         if not uid:
-            print("Accepted response has no uid", file=sys.stderr)
+            log("Accepted response has no uid")
             return 1
-        print(f"job {uid}", file=sys.stderr)
+        log(f"job {uid}")
         deadline = None if args.timeout is None else time.monotonic() + args.timeout
         try:
             body = poll_until_done(service_root(args.svc_url), uid, deadline)
@@ -477,9 +482,9 @@ def main(argv: list[str]) -> int:
         status = 200
     elif status != 200:
         detail = body.decode("utf-8", errors="replace").strip()
-        print(f"Service returned HTTP {status}", file=sys.stderr)
+        log(f"Service returned HTTP {status}")
         if detail:
-            print(detail, file=sys.stderr)
+            log(detail)
         return 1
 
     payload = None
@@ -488,33 +493,32 @@ def main(argv: list[str]) -> int:
         try:
             payload = json.loads(body)
         except json.JSONDecodeError as exc:
-            print(f"Response is not JSON: {exc}", file=sys.stderr)
+            log(f"Response is not JSON: {exc}")
             return 1
 
     client_dropped: list[str] = []
     if isinstance(payload, dict) and hallucination_blob.strip():
         client_dropped = filter_payload(payload, hallucination_blob)
         for phrase in client_dropped:
-            print(f"dropped hallucination: {phrase}", file=sys.stderr)
+            log(f"dropped hallucination: {phrase}")
         reported = payload.get("dropped_hallucinations")
         if isinstance(reported, list):
             for phrase in reported:
                 if phrase not in client_dropped:
-                    print(f"service dropped hallucination: {phrase}", file=sys.stderr)
+                    log(f"service dropped hallucination: {phrase}")
 
     if json_path is not None:
         if client_dropped and isinstance(payload, dict):
             write_text(json_path, json.dumps(payload, ensure_ascii=False) + "\n")
         else:
             write_bytes(json_path, body)
-        print(f"wrote {json_path}", file=sys.stderr)
+        log(f"wrote {json_path}")
 
     if srt_path is None:
         if isinstance(payload, dict):
-            print(
+            log(
                 f"language={payload.get('language')} speakers={payload.get('num_speakers')} "
-                f"segments={len(payload.get('segments') or [])}",
-                file=sys.stderr,
+                f"segments={len(payload.get('segments') or [])}"
             )
         return 0
 
